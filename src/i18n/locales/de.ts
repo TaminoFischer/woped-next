@@ -115,6 +115,7 @@ export default {
     snap: 'Einrasten',
     rotateCW: '90° im Uhrzeigersinn drehen',
     rotateCCW: '90° gegen Uhrzeigersinn drehen',
+    discord: 'Unserer Discord-Community beitreten',
   },
 
   // Editor

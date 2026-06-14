@@ -115,6 +115,7 @@ export default {
     snap: 'Snap',
     rotateCW: 'Rotate 90° Clockwise',
     rotateCCW: 'Rotate 90° Counter-Clockwise',
+    discord: 'Join our Discord community',
   },
 
   // Editor
