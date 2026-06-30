@@ -9,10 +9,6 @@
 
 > Built for education and research — WoPeD Next brings Petri net modeling, token-game simulation, and workflow analysis to the browser. It is the web successor to the Java Swing **WoPeD** (Workflow Petri Net Designer) from DHBW Karlsruhe.
 
-<p align="center">
-  <img src="public/woped-splash.jpg" alt="WoPeD Next editor" width="720" />
-</p>
-
 ---
 
 ## Features
