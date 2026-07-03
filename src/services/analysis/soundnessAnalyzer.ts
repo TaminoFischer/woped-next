@@ -2,6 +2,12 @@ import type { PetriNet, Transition, Arc } from '@/types/petri-net'
 import type { AnalysisResult, AnalysisIssue, AnalysisDetailItem, CoverabilityGraph, CoverabilityNode, CoverabilityEdge } from '@/types/analysis'
 import { IssueCodes } from '@/types/analysis'
 import { computeStatistics } from './statistics'
+import {
+  effectiveInputLogic,
+  effectiveOutputLogic,
+  getInputArcs,
+  getOutputArcs,
+} from '@/utils/operatorSemantics'
 
 // Maximum number of states to explore to prevent infinite loops
 const MAX_STATES = 1000
@@ -505,40 +511,43 @@ export function buildCoverabilityGraph(
     }
 
     for (const transitionId of enabled) {
-      const newMarking = fireTransition(net, current.marking, transitionId)
-
-      // Check for omega (unboundedness)
-      checkAndApplyOmega(newMarking, nodes, current)
-
-      const key = markingKey(newMarking)
-      let targetNode = visited.get(key)
-
-      if (!targetNode) {
-        targetNode = {
-          id: `M${nodes.length}`,
-          marking: newMarking,
-          parentId: current.id,
-          firedTransition: transitionId,
-          isDeadlock: false,
-          isInitial: false,
-          isFinal: checkFinalMarking(newMarking, sinkPlaces.map((p) => p.id)),
-        }
-        nodes.push(targetNode)
-        visited.set(key, targetNode)
-        queue.push(targetNode)
-      }
-
-      // Get transition name
+      // Get transition name (shared across all firing modes of this node)
       const transition =
         net.transitions.find((t) => t.id === transitionId) ||
         net.operators.find((o) => o.id === transitionId)
 
-      edges.push({
-        from: current.id,
-        to: targetNode.id,
-        transitionId,
-        transitionName: transition?.name || transitionId,
-      })
+      // Each firing mode (e.g. one per XOR branch) yields its own successor.
+      for (const mode of getFiringModes(net, current.marking, transitionId)) {
+        const newMarking = applyFiringMode(current.marking, mode)
+
+        // Check for omega (unboundedness)
+        checkAndApplyOmega(newMarking, nodes, current)
+
+        const key = markingKey(newMarking)
+        let targetNode = visited.get(key)
+
+        if (!targetNode) {
+          targetNode = {
+            id: `M${nodes.length}`,
+            marking: newMarking,
+            parentId: current.id,
+            firedTransition: transitionId,
+            isDeadlock: false,
+            isInitial: false,
+            isFinal: checkFinalMarking(newMarking, sinkPlaces.map((p) => p.id)),
+          }
+          nodes.push(targetNode)
+          visited.set(key, targetNode)
+          queue.push(targetNode)
+        }
+
+        edges.push({
+          from: current.id,
+          to: targetNode.id,
+          transitionId,
+          transitionName: transition?.name || transitionId,
+        })
+      }
     }
   }
 
@@ -571,42 +580,99 @@ function getEnabledTransitions(
 }
 
 /**
- * Check if a transition is enabled
+ * Whether an input place holds enough tokens to satisfy an arc under a marking.
+ * Omega (unbounded) counts as always sufficient.
+ */
+function tokensSufficient(
+  marking: Record<string, number | 'omega'>,
+  arc: Arc
+): boolean {
+  const tokens = marking[arc.sourceId]
+  if (tokens === 'omega') return true
+  return (tokens ?? 0) >= arc.weight
+}
+
+/**
+ * Check if a transition/operator is enabled, honouring AND/XOR input semantics.
+ * AND-input requires every input place to be sufficiently marked; XOR-input
+ * (XOR-join operators) only requires at least one marked input branch.
  */
 function isTransitionEnabled(
   net: PetriNet,
   marking: Record<string, number | 'omega'>,
   transitionId: string
 ): boolean {
-  const inputArcs = net.arcs.filter((arc) => arc.targetId === transitionId)
+  const inputArcs = getInputArcs(net, transitionId)
 
   // Must have at least one input arc
   if (inputArcs.length === 0) return false
 
-  for (const arc of inputArcs) {
-    const tokens = marking[arc.sourceId] ?? 0
-    if (tokens === 'omega') continue // Omega means infinite
-    if (tokens < arc.weight) return false
+  if (effectiveInputLogic(net, transitionId) === 'xor') {
+    return inputArcs.some((arc) => tokensSufficient(marking, arc))
   }
 
-  return true
+  return inputArcs.every((arc) => tokensSufficient(marking, arc))
 }
 
 /**
- * Fire a transition and return new marking
+ * A concrete way an enabled transition/operator can fire: the arcs it consumes
+ * from and the arcs it produces to. AND sides always use all arcs; XOR sides
+ * pick exactly one arc, so a single node may expand into several firing modes
+ * (e.g. an XOR-split produces one distinct successor marking per output branch).
  */
-function fireTransition(
+interface FiringMode {
+  consume: Arc[]
+  produce: Arc[]
+}
+
+/**
+ * Enumerate all firing modes of an enabled transition/operator under a marking.
+ *
+ * This is the heart of correct XOR handling in the state space: an XOR-split
+ * yields one mode per outgoing arc (⇒ one edge/successor per branch) instead of
+ * flooding all branches at once like an AND-split; an XOR-join yields one mode
+ * per currently marked incoming branch.
+ */
+function getFiringModes(
   net: PetriNet,
   marking: Record<string, number | 'omega'>,
   transitionId: string
+): FiringMode[] {
+  const inputArcs = getInputArcs(net, transitionId)
+  const outputArcs = getOutputArcs(net, transitionId)
+
+  const consumeOptions: Arc[][] =
+    effectiveInputLogic(net, transitionId) === 'xor'
+      ? inputArcs.filter((arc) => tokensSufficient(marking, arc)).map((a) => [a])
+      : [inputArcs]
+
+  const produceOptions: Arc[][] =
+    effectiveOutputLogic(net, transitionId) === 'xor'
+      ? outputArcs.length > 0
+        ? outputArcs.map((a) => [a])
+        : [[]]
+      : [outputArcs]
+
+  const modes: FiringMode[] = []
+  for (const consume of consumeOptions) {
+    for (const produce of produceOptions) {
+      modes.push({ consume, produce })
+    }
+  }
+  return modes
+}
+
+/**
+ * Apply a single firing mode to a marking and return the resulting marking.
+ */
+function applyFiringMode(
+  marking: Record<string, number | 'omega'>,
+  mode: FiringMode
 ): Record<string, number | 'omega'> {
   const newMarking: Record<string, number | 'omega'> = { ...marking }
 
-  const inputArcs = net.arcs.filter((arc) => arc.targetId === transitionId)
-  const outputArcs = net.arcs.filter((arc) => arc.sourceId === transitionId)
-
-  // Remove tokens from input places
-  for (const arc of inputArcs) {
+  // Remove tokens from the consumed input places
+  for (const arc of mode.consume) {
     const current = newMarking[arc.sourceId]
     if (current === 'omega') continue
     const newVal = (current ?? 0) - arc.weight
@@ -617,8 +683,8 @@ function fireTransition(
     }
   }
 
-  // Add tokens to output places
-  for (const arc of outputArcs) {
+  // Add tokens to the produced output places
+  for (const arc of mode.produce) {
     const current = newMarking[arc.targetId]
     if (current === 'omega') continue
     newMarking[arc.targetId] = ((current as number) ?? 0) + arc.weight
@@ -796,36 +862,39 @@ export function buildReachabilityGraph(
     }
 
     for (const transitionId of enabled) {
-      const newMarking = fireTransition(net, current.marking, transitionId)
-
-      const key = markingKey(newMarking)
-      let targetNode = visited.get(key)
-
-      if (!targetNode) {
-        targetNode = {
-          id: `M${nodes.length}`,
-          marking: newMarking,
-          parentId: current.id,
-          firedTransition: transitionId,
-          isDeadlock: false,
-          isInitial: false,
-          isFinal: checkFinalMarking(newMarking, sinkPlaces.map((p) => p.id)),
-        }
-        nodes.push(targetNode)
-        visited.set(key, targetNode)
-        queue.push(targetNode)
-      }
-
       const transition =
         net.transitions.find((t) => t.id === transitionId) ||
         net.operators.find((o) => o.id === transitionId)
 
-      edges.push({
-        from: current.id,
-        to: targetNode.id,
-        transitionId,
-        transitionName: transition?.name || transitionId,
-      })
+      // Each firing mode (e.g. one per XOR branch) yields its own successor.
+      for (const mode of getFiringModes(net, current.marking, transitionId)) {
+        const newMarking = applyFiringMode(current.marking, mode)
+
+        const key = markingKey(newMarking)
+        let targetNode = visited.get(key)
+
+        if (!targetNode) {
+          targetNode = {
+            id: `M${nodes.length}`,
+            marking: newMarking,
+            parentId: current.id,
+            firedTransition: transitionId,
+            isDeadlock: false,
+            isInitial: false,
+            isFinal: checkFinalMarking(newMarking, sinkPlaces.map((p) => p.id)),
+          }
+          nodes.push(targetNode)
+          visited.set(key, targetNode)
+          queue.push(targetNode)
+        }
+
+        edges.push({
+          from: current.id,
+          to: targetNode.id,
+          transitionId,
+          transitionName: transition?.name || transitionId,
+        })
+      }
     }
   }
 
